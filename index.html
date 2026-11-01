@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Bot</title>
+  <style>
+    :root { color-scheme: light dark; --text: #222; --muted: #666; --line: #ddd; --bg: #fff; }
+    @media (prefers-color-scheme: dark) {
+      :root { --text: #e6e6e6; --muted: #a3a3a3; --line: #3a3a3a; --bg: #0e1117; }
+    }
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 60px auto; padding: 0 16px; text-align: center;
+           color: var(--text); background: var(--bg); }
+    /* Inside the Streamlit app (same colors as its default themes): drop the duplicate title. */
+    body.embedded { margin-top: 12px; }
+    body.embedded h1 { display: none; }
+    button { font-size: 1rem; padding: 10px 22px; margin: 4px; cursor: pointer; }
+    #mic { display: inline-block; width: 16px; height: 16px; margin-right: 8px; border-radius: 50%;
+           background: #bbb; vertical-align: middle; transition: transform 60ms linear; }
+    #mic.live { background: #2a9d3a; }
+    #mic-select { font-size: 0.95rem; padding: 4px; margin-left: 6px; max-width: 100%; }
+    #status { color: var(--muted); }
+    #latency { color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
+    #transcript { text-align: left; max-height: 260px; overflow-y: auto; border-top: 1px solid var(--line); padding-top: 6px; }
+    #transcript p { margin: 6px 0; line-height: 1.4; }
+    #transcript .who { font-weight: 600; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Voice Bot</h1>
+  <button id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <p>
+    <span id="mic"></span><label for="mic-select">Microphone</label>
+    <select id="mic-select"><option value="">System default</option></select>
+  </p>
+  <p id="status">Disconnected</p>
+  <p id="latency"></p>
+  <div id="transcript"></div>
+  <audio id="bot-audio" autoplay></audio>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let pc, micStream, pingTimer, meterCtx, meterFrame, botLine;
+
+// Per-call settings (bot, voice, prompt, silence) from the URL, e.g. set by the Streamlit app.
+const callOptions = Object.fromEntries(new URLSearchParams(location.search));
+if (window.self !== window.top) document.body.classList.add("embedded");
+
+async function connect() {
+  $("connect").disabled = true;
+  $("status").textContent = "Connecting…";
+  $("transcript").replaceChildren();
+  $("latency").textContent = "";
+  botLine = null;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia(micConstraints());
+    startMicMeter(micStream);
+    await listMics();  // mic permission is granted now, so device names are available
+
+    // No STUN/TURN servers: browser and bot run on the same machine.
+    pc = new RTCPeerConnection({ iceServers: [] });
+    pc.ontrack = (e) => {
+      if (e.track.kind === "audio") $("bot-audio").srcObject = new MediaStream([e.track]);
+    };
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      $("status").textContent = pc.connectionState === "connected" ? "Connected, start talking" : pc.connectionState;
+      if (pc.connectionState === "failed") disconnect("Connection failed");
+    };
+
+    // Pipecat's SmallWebRTC server expects transceiver 0 = audio, 1 = video (unused here).
+    pc.addTransceiver(micStream.getAudioTracks()[0], { direction: "sendrecv" });
+    pc.addTransceiver("video", { direction: "sendrecv" });
+
+    // Keep-alive: the server treats the browser as gone a few seconds after pings stop.
+    const channel = pc.createDataChannel("chat");
+    channel.onopen = () => {
+      pingTimer = setInterval(() => channel.readyState === "open" && channel.send("ping"), 1000);
+    };
+    channel.onmessage = (e) => handleBotMessage(e.data);
+
+    // Send the offer once all local ICE candidates are in it, then apply the bot's answer.
+    await pc.setLocalDescription(await pc.createOffer());
+    await iceGatheringComplete(pc);
+    const res = await fetch("/api/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type, request_data: callOptions }),
+    });
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const { sdp, type } = await res.json();
+    await pc.setRemoteDescription({ sdp, type });
+    $("disconnect").disabled = false;
+  } catch (err) {
+    disconnect(`Error: ${err.message}`);
+  }
+}
+
+function disconnect(message = "Disconnected") {
+  clearInterval(pingTimer);
+  if (pc) { const old = pc; pc = null; old.close(); }  // the server sees the close and stops the bot
+  micStream?.getTracks().forEach((t) => t.stop());
+  micStream = null;
+  stopMicMeter();
+  $("bot-audio").srcObject = null;
+  $("connect").disabled = false;
+  $("disconnect").disabled = true;
+  $("status").textContent = message;
+}
+
+// Messages from the bot: the conversation as it happens, and each reply's latency.
+const STAGE_LABELS = { "STT final": "heard you", "LLM first token": "first word", "TTS first byte": "first audio" };
+
+function handleBotMessage(raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { return; }
+  if (msg.type === "transcript" && msg.role === "user") {
+    botLine = null;
+    addLine("You", msg.text);
+  } else if (msg.type === "transcript" && msg.role === "bot") {
+    botLine ??= addLine("Bot", "");
+    botLine.textContent += msg.text;
+  } else if (msg.type === "reply-end") {
+    botLine = null;
+  } else if (msg.type === "latency") {
+    const parts = Object.entries(STAGE_LABELS)
+      .filter(([stage]) => msg.stages[stage] != null)
+      .map(([stage, label]) => `${label} ${(msg.stages[stage] / 1000).toFixed(1)} s`);
+    $("latency").textContent = `Last reply, after you stopped talking: ${parts.join(" · ")}`;
+  }
+}
+
+// Adds a line to the transcript (consecutive pieces from the same speaker are merged).
+function addLine(who, text) {
+  const box = $("transcript");
+  const last = box.lastElementChild;
+  if (last?.dataset.who === who && who === "You") {
+    const span = last.querySelector(".text");
+    span.textContent += " " + text;
+    return span;
+  }
+  const line = document.createElement("p");
+  line.dataset.who = who;
+  const name = Object.assign(document.createElement("span"), { className: "who", textContent: `${who}:` });
+  const span = Object.assign(document.createElement("span"), { className: "text", textContent: text });
+  line.append(name, span);
+  box.append(line);
+  box.scrollTop = box.scrollHeight;
+  return span;
+}
+
+// Microphone choice: "" means the system default. The choice is remembered per browser.
+function micConstraints() {
+  const deviceId = $("mic-select").value;
+  return {
+    audio: {
+      deviceId: deviceId ? { exact: deviceId } : undefined,
+      // Echo cancellation stops the bot hearing (and interrupting) itself.
+      echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+    },
+  };
+}
+
+const savedMic = () => { try { return localStorage.getItem("mic") || ""; } catch { return ""; } };
+const saveMic = () => { try { localStorage.setItem("mic", $("mic-select").value); } catch {} };
+
+// Fill the dropdown. Browsers hide device names until mic access is allowed,
+// so before that only "System default" is listed.
+async function listMics() {
+  const select = $("mic-select");
+  const wanted = select.value || savedMic();
+  const mics = (await navigator.mediaDevices.enumerateDevices()).filter(
+    (d) => d.kind === "audioinput" && d.deviceId && !["default", "communications"].includes(d.deviceId)
+  );
+  select.replaceChildren(
+    new Option("System default", ""),
+    ...mics.map((m, i) => new Option(m.label || `Microphone ${i + 1}`, m.deviceId))
+  );
+  if (mics.some((m) => m.deviceId === wanted)) select.value = wanted;
+}
+
+// Opening the dropdown before the first call asks for mic access once, to reveal device names.
+async function revealMicNames() {
+  if ($("mic-select").options.length > 1 || micStream) return;
+  try {
+    const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
+    probe.getTracks().forEach((t) => t.stop());
+    await listMics();
+  } catch (err) {
+    $("status").textContent = `Microphone access: ${err.message}`;
+  }
+}
+
+// Picking another mic mid-call swaps the track the bot hears, without reconnecting.
+async function switchMic() {
+  saveMic();
+  if (!pc || !micStream) return;
+  try {
+    const next = await navigator.mediaDevices.getUserMedia(micConstraints());
+    await pc.getTransceivers()[0].sender.replaceTrack(next.getAudioTracks()[0]);
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = next;
+    stopMicMeter();
+    startMicMeter(micStream);
+  } catch (err) {
+    $("status").textContent = `Couldn't switch microphone: ${err.message}`;
+  }
+}
+
+function iceGatheringComplete(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    pc.addEventListener("icegatheringstatechange", () => {
+      if (pc.iceGatheringState === "complete") resolve();
+    });
+  });
+}
+
+// Mic indicator: the dot turns green while connected and grows with your voice level.
+function startMicMeter(stream) {
+  meterCtx = new AudioContext();
+  const analyser = meterCtx.createAnalyser();
+  analyser.fftSize = 512;
+  meterCtx.createMediaStreamSource(stream).connect(analyser);
+  const samples = new Uint8Array(analyser.fftSize);
+  $("mic").classList.add("live");
+  (function tick() {
+    analyser.getByteTimeDomainData(samples);
+    let sum = 0;
+    for (const s of samples) sum += ((s - 128) / 128) ** 2;
+    const level = Math.min(1, Math.sqrt(sum / samples.length) * 5);
+    $("mic").style.transform = `scale(${1 + level * 1.5})`;
+    meterFrame = requestAnimationFrame(tick);
+  })();
+}
+
+function stopMicMeter() {
+  cancelAnimationFrame(meterFrame);
+  meterCtx?.close();
+  meterCtx = null;
+  $("mic").classList.remove("live");
+  $("mic").style.transform = "";
+}
+
+$("connect").onclick = connect;
+$("disconnect").onclick = () => disconnect();
+$("mic-select").onfocus = revealMicNames;
+$("mic-select").onchange = switchMic;
+navigator.mediaDevices.addEventListener("devicechange", listMics);
+listMics();
+</script>
+</body>
+</html>

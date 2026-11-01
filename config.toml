@@ -1,0 +1,19 @@
+# Streamlit settings for this app.
+
+[server]
+# Only this laptop can open the app.
+address = "127.0.0.1"
+port = 8501
+# Don't ask for an e-mail address on the first run.
+headless = true
+# The project folder contains .venv; watching it for changes would be slow.
+fileWatcherType = "none"
+
+[browser]
+# Don't send anonymous usage statistics to Streamlit.
+gatherUsageStats = false
+serverAddress = "127.0.0.1"
+
+[client]
+# Hide developer options, including the "Deploy" button (which publishes to Streamlit's cloud).
+toolbarMode = "minimal"
